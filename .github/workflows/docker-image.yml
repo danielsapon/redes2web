@@ -27,7 +27,7 @@ jobs:
         echo "Fin de login"
     - name: Build Docker Image
       run: |
-        docker build -t danielsapon06/redes2web:flaskv2 .
+        docker build -t danielsapon06/redes2web:flaskv2 ./mesoconFlask
     - name: Push Docker Image
       run: |
         docker push danielsapon06/redes2web:flaskv2
