@@ -44,7 +44,7 @@ jobs:
             -p 127.0.0.1:8080:5000 \
             "$IMAGE_NAME:$IMAGE_TAG"
           curl --fail --show-error \
-            --retry 15 --retry-delay 1 --retry-connrefused \
+            --retry 15 --retry-delay 1 --retry-all-errors \
             --retry-max-time 30 --max-time 5 \
             http://127.0.0.1:8080/
 
@@ -111,7 +111,7 @@ jobs:
           if d run -d --name "$name" --restart unless-stopped \
                -p 5001:5000 "$image" &&
              curl --fail --show-error \
-               --retry 15 --retry-delay 1 --retry-connrefused \
+               --retry 15 --retry-delay 1 --retry-all-errors \
                --retry-max-time 30 --max-time 5 \
                http://127.0.0.1:5001/; then
             echo "Despliegue correcto: $image"
