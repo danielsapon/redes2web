@@ -1,33 +1,127 @@
-name: Docker Image CI
+name: Docker CI/CD - AWS
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: redes2web-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: danielsapon06/redes2web
+  IMAGE_TAG: sha-${{ github.sha }}
 
 jobs:
-
-  build:
-
+  build-test-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch_depth: 0
-    - name: Docker login
-      env:
-        docker_login: ${{ secrets.DOCKER_USER }}
-        docker_password: ${{ secrets.DOCKER_PASSWORD }}
-      run: |
-        echo "Iniciando login"
-        docker login -u $docker_login -p $docker_password
-        echo "Fin de login"
-    - name: Build Docker Image
-      run: |
-        docker build -t danielsapon06/redes2web:flaskv2 ./mesoconFlask
-    - name: Push Docker Image
-      run: |
-        docker push danielsapon06/redes2web:flaskv2
+      - name: Obtener el codigo
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Construir la imagen
+        run: |
+          docker build \
+            -t "$IMAGE_NAME:$IMAGE_TAG" \
+            -t "$IMAGE_NAME:flaskv2" \
+            ./mesoconFlask
+
+      - name: Probar Flask
+        run: |
+          set -euo pipefail
+          trap 'docker logs ci-test || true; docker rm -f ci-test >/dev/null 2>&1 || true' EXIT
+          docker run -d --name ci-test \
+            -p 127.0.0.1:8080:5000 \
+            "$IMAGE_NAME:$IMAGE_TAG"
+          curl --fail --show-error \
+            --retry 15 --retry-delay 1 --retry-connrefused \
+            --retry-max-time 30 --max-time 5 \
+            http://127.0.0.1:8080/
+
+      - name: Iniciar sesion en Docker Hub
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DOCKER_USER: ${{ secrets.DOCKER_USER }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          printf '%s' "$DOCKER_PASSWORD" |
+            docker login -u "$DOCKER_USER" --password-stdin
+
+      - name: Publicar la imagen
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "$IMAGE_NAME:$IMAGE_TAG"
+          docker push "$IMAGE_NAME:flaskv2"
+
+      - name: Desplegar en AWS
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST_KEY: ${{ secrets.EC2_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          ssh_dir=$(mktemp -d "$RUNNER_TEMP/redes2web-ssh.XXXXXX")
+          trap 'rm -rf "$ssh_dir"' EXIT
+          umask 077
+          printf '%s\n' "$EC2_SSH_KEY" > "$ssh_dir/key"
+          printf '%s %s\n' "$EC2_HOST" "$EC2_HOST_KEY" > "$ssh_dir/known_hosts"
+
+          ssh -i "$ssh_dir/key" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$ssh_dir/known_hosts" \
+            -o ConnectTimeout=20 \
+            "$EC2_USER@$EC2_HOST" \
+            "bash -s -- '$IMAGE_NAME:$IMAGE_TAG'" <<'REMOTE'
+          set -euo pipefail
+          d() { sudo -n docker "$@"; }
+          image="$1"
+          name=redes2web
+          backup=redes2web-anterior
+
+          d pull "$image"
+
+          if ! d container inspect "$name" >/dev/null 2>&1 &&
+             d container inspect vigorous_mendel >/dev/null 2>&1; then
+            d rename vigorous_mendel "$name"
+          fi
+
+          d rm "$backup" >/dev/null 2>&1 || true
+          had_previous=false
+
+          if d container inspect "$name" >/dev/null 2>&1; then
+            d rename "$name" "$backup"
+            had_previous=true
+            d stop "$backup"
+          fi
+
+          if d run -d --name "$name" --restart unless-stopped \
+               -p 5001:5000 "$image" &&
+             curl --fail --show-error \
+               --retry 15 --retry-delay 1 --retry-connrefused \
+               --retry-max-time 30 --max-time 5 \
+               http://127.0.0.1:5001/; then
+            echo "Despliegue correcto: $image"
+          else
+            d logs --tail 50 "$name" || true
+            d rm -f "$name" || true
+            if [ "$had_previous" = true ]; then
+              d rename "$backup" "$name"
+              d start "$name"
+            fi
+            exit 1
+          fi
+          REMOTE
